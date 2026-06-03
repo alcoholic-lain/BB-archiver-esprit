@@ -1,0 +1,10 @@
+requests>=2.25.0
+selenium>=4.0.0
+xmltodict
+requests
+colorama
+browser-cookie3
+playwright
+beautifulsoup4
+rich
+silly_logger

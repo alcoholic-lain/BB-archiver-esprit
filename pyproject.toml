@@ -1,0 +1,17 @@
+[project]
+name = "bb-archiver-esprit"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "beautifulsoup4>=4.14.3",
+    "browser-cookie3>=0.20.1",
+    "colorama>=0.4.6",
+    "playwright>=1.60.0",
+    "requests>=2.25.0",
+    "rich>=15.0.0",
+    "selenium>=4.0.0",
+    "silly-logger>=0.1.7",
+    "xmltodict>=1.0.4",
+]
