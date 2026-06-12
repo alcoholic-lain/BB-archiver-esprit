@@ -8,9 +8,9 @@ ESPRIT Complete Downloader - Download and archive Blackboard course content with
 - Embeds images inline as base64 (fixes missing images in saved HTML)
 - Diagnoses every URL in the body and reports status
 - Faithful HTML reproduction (keeps all inline styles, fonts, colours)
-- next/previous page buttons and navigation between courses and classes
+- next/previous page buttons and navigation between courses and classes , working :D
 - proper html indexing , makes you feel like you're actually using BB
-- you can add ass many classes as you want , it stacks
+- you can add as many classes as you want , it stacks
 
 
 ## Setup
