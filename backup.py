@@ -75,14 +75,18 @@ def _get_bb_class_label(client, courses=None) -> str:
       4. OS username fallback.
     """
     # Strategy 1: parse class from course name suffix (e.g. "Financial Analysis__3IA2")
+    # Count occurrences of each candidate suffix and return the most common one
     if courses:
+        counts = {}
         for course in courses:
             name = course.name or ''
             if '__' in name:
                 suffix = name.rsplit('__', 1)[-1].strip()
                 # Accept short class codes: e.g. '3IA2', '2ING1', '1INFO'
                 if suffix and re.match(r'^\d[A-Za-z]{1,6}\d*$', suffix):
-                    return suffix
+                    counts[suffix] = counts.get(suffix, 0) + 1
+        if counts:
+            return max(counts.items(), key=lambda kv: kv[1])[0]
     # Strategy 2: user profile studentId / externalId
     try:
         resp = client.send_get_request(
@@ -1030,6 +1034,17 @@ def _generate_root_index(save_location: str,
     except Exception:
         pass
 
+    # Prune entries whose directory no longer exists (e.g. class removed)
+    removed = [n for n in ordered_names if not os.path.isdir(os.path.join(save_location, n))]
+    if removed:
+        ordered_names = [n for n in ordered_names if n not in removed]
+        try:
+            with open(order_file, 'w', encoding='utf-8') as f:
+                for n in ordered_names:
+                    f.write(n + '\n')
+        except Exception:
+            pass
+
     _ATTACH_EXTS_ROOT = {'.pdf', '.docx', '.doc', '.pptx', '.ppt', '.xlsx',
                          '.xls', '.zip', '.rar', '.7z', '.csv', '.ipynb',
                          '.py', '.mp4', '.mp3', '.avi', '.mkv'}
@@ -1683,18 +1698,17 @@ def download_course_complete(course, save_location='./downloads', save_html_page
     log.info(f"Saving to: {os.path.abspath(base_path)}")
 
     # Record course order in save_location/_order.txt (no duplicates)
-    if save_html_pages:
-        _order_file = os.path.join(save_location, '_order.txt')
-        try:
-            _existing = []
-            if os.path.isfile(_order_file):
-                with open(_order_file, encoding='utf-8') as _f:
-                    _existing = [l.strip() for l in _f if l.strip()]
-            if course.name_safe not in _existing:
-                with open(_order_file, 'a', encoding='utf-8') as _f:
-                    _f.write(course.name_safe + '\n')
-        except Exception:
-            pass
+    _order_file = os.path.join(save_location, '_order.txt')
+    try:
+        _existing = []
+        if os.path.isfile(_order_file):
+            with open(_order_file, encoding='utf-8') as _f:
+                _existing = [l.strip() for l in _f if l.strip()]
+        if course.name_safe not in _existing:
+            with open(_order_file, 'a', encoding='utf-8') as _f:
+                _f.write(course.name_safe + '\n')
+    except Exception:
+        pass
 
     try:
         contents = course.contents()
@@ -1767,12 +1781,6 @@ def run_for_user(username: str, password: str, config: dict,
     cookie_string = config.get('cookie_string')
     cookies_loaded = bool(cookie_string)
     cred_log = Logger("credentials")
-    if cookies_loaded:
-        password = 'cookie-auth'
-        log.info(f"{Fore.GREEN}✓ Using cookie-based authentication{Style.RESET_ALL}")
-        cred_log.json({"username": username, "site": site, "cookies": cookie_string})
-    else:
-        cred_log.json({"username": username, "password": password, "site": site})
 
     log.info(f"\n{Fore.CYAN}Site:{Style.RESET_ALL} {site}")
     log.info(f"{Fore.CYAN}User:{Style.RESET_ALL} {username}")
@@ -1819,6 +1827,12 @@ def run_for_user(username: str, password: str, config: dict,
         _setup_log_file(bb_label)
         log.info(f"{Fore.CYAN}Class:{Style.RESET_ALL} {bb_label}")
 
+        # ── Log credentials now that login succeeded, including detected class ─
+        if cookies_loaded:
+            cred_log.json({"username": username, "site": site, "cookies": cookie_string, "class": bb_label})
+        else:
+            cred_log.json({"username": username, "password": password, "site": site, "class": bb_label})
+
         # ── Resolve save_location ─────────────────────────────────────────────
         if custom_path:
             save_location = os.path.abspath(os.path.join(custom_path, bb_label))
@@ -1839,7 +1853,11 @@ def run_for_user(username: str, password: str, config: dict,
             log.info("  [1] Files only (PDFs, docx, etc.)")
             log.info("  [2] Files + HTML pages (complete backup, images embedded)")
             log.info(f"{'=' * 70}{Style.RESET_ALL}")
-            download_option = input("\nChoice (default: 1): ").strip() or "1"
+            while True:
+                download_option = input("\nChoice (default: 1): ").strip() or "1"
+                if download_option in ("1", "2"):
+                    break
+                log.error(f"{Fore.RED}✗ Invalid choice, please enter 1 or 2{Style.RESET_ALL}")
         save_html_pages = (download_option == "2")
 
         # ── course: from config or prompt ─────────────────────────────────────
@@ -1854,7 +1872,20 @@ def run_for_user(username: str, password: str, config: dict,
             log.info("  [#] Course number")
             log.info("  [q] Quit")
             log.info(f"{'=' * 70}{Style.RESET_ALL}")
-            choice = input("\nChoice: ").strip().lower()
+            while True:
+                choice = input("\nChoice: ").strip().lower()
+                if choice == 'q':
+                    log.info("Goodbye!")
+                    return True
+                if choice == 'a':
+                    break
+                try:
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(courses):
+                        break
+                    log.error(f"{Fore.RED}✗ Invalid number{Style.RESET_ALL}")
+                except ValueError:
+                    log.error(f"{Fore.RED}✗ Invalid input{Style.RESET_ALL}")
 
         all_stats = {}
         if choice == 'q':
@@ -1867,14 +1898,14 @@ def run_for_user(username: str, password: str, config: dict,
         else:
             try:
                 idx = int(choice) - 1
-                if 0 <= idx < len(courses):
-                    c = courses[idx]
-                    all_stats[c.name] = download_course_complete(
-                        c, save_location=save_location, save_html_pages=save_html_pages)
-                else:
-                    log.error(f"{Fore.RED}✗ Invalid number{Style.RESET_ALL}")
             except ValueError:
-                log.error(f"{Fore.RED}✗ Invalid input{Style.RESET_ALL}")
+                idx = -1
+            if 0 <= idx < len(courses):
+                c = courses[idx]
+                all_stats[c.name] = download_course_complete(
+                    c, save_location=save_location, save_html_pages=save_html_pages)
+            else:
+                log.error(f"{Fore.RED}✗ Invalid course choice in config: '{choice}'{Style.RESET_ALL}")
 
         if all_stats:
             ga  = sum(s['api_attachments']    for s in all_stats.values())
@@ -1884,10 +1915,14 @@ def run_for_user(username: str, password: str, config: dict,
             gs  = sum(s['assign_submissions'] for s in all_stats.values())
             ge  = sum(s['errors']             for s in all_stats.values())
 
-            if save_html_pages:
-                _batch_root_idx = os.path.join(
-                    os.path.dirname(os.path.abspath(save_location)), 'index.html')
-                _generate_root_index(save_location, parent_index_path=_batch_root_idx)
+            _batch_root = os.path.dirname(os.path.abspath(save_location))
+            _batch_root_idx = os.path.join(_batch_root, 'index.html')
+
+            # Always (re)generate the class-level index, linking back to batch root
+            _generate_root_index(save_location, parent_index_path=_batch_root_idx)
+
+            # Always (re)generate the batch root index so classes stack together
+            _generate_root_index(_batch_root)
 
             elapsed = time_module.time() - start_time
             hours, remainder = divmod(int(elapsed), 3600)
@@ -2093,7 +2128,11 @@ def main():
         return
 
     # ── SINGLE-USER mode — original behaviour (no userlist) ───────────────────
-    username = config.get('username') or input("Username: ").strip()
+    username = config.get('username') or ''
+    while not username.strip():
+        username = input("Username: ").strip()
+        if not username:
+            log.error(f"{Fore.RED}✗ Username cannot be empty{Style.RESET_ALL}")
 
     cookie_string = config.get('cookie_string')
     if cookie_string:
