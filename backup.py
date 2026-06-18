@@ -21,6 +21,7 @@ import getpass
 from datetime import datetime
 from colorama import Fore, Style, init
 from urllib.parse import unquote, urlparse
+from typing import Optional, List
 import time as time_module
 from silly_logger import Logger
 
@@ -173,13 +174,331 @@ def fetch_as_base64(session, url, site, indent=''):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+# ── Shared attachment-viewer widget ──────────────────────────────────────────
+#    CSS and JS are inlined directly into every generated HTML page via
+#    inline_viewer_tags(), so no external .css/.js files are ever written.
+
+_VIEWER_CSS = """
+.av-doc-viewer{
+  --av-bar-bg:#1c1c1c;--av-bar-fg:#f2f2f2;--av-bar-fg-dim:#b8b8b8;
+  --av-page-bg:#f4f5f6;--av-card-bg:#fff;--av-accent:#3b6fe0;
+  --av-border:#dcdde0;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+  color:#1f1f1f;max-width:960px;margin:16px 0;position:relative;
+  border:1px solid var(--av-border);border-radius:8px;
+  background:var(--av-card-bg);
+  box-shadow:0 1px 3px rgba(0,0,0,.08);
+}
+/* NOTE: overflow:hidden was removed from .av-doc-viewer above — it was
+   clipping the absolutely-positioned "Copy file path" dropdown, making it
+   invisible (especially when the card is collapsed, since the container's
+   height was just the header). Corner-rounding is now done locally on the
+   header and content wrap instead (see below), so the rounded-card look is
+   preserved without clipping the dropdown. */
+.av-doc-viewer,.av-doc-viewer *{box-sizing:border-box;margin:0;padding:0;}
+.av-doc-header{
+  display:flex;align-items:center;gap:10px;
+  padding:10px 14px;border-bottom:1px solid var(--av-border);
+  background:var(--av-card-bg);cursor:pointer;user-select:none;
+  border-radius:8px;
+}
+.av-doc-viewer.av-static .av-doc-header{cursor:default;}
+.av-file-icon-wrap{
+  width:28px;height:28px;flex:none;border-radius:5px;
+  display:flex;align-items:center;justify-content:center;
+  font-size:10px;font-weight:700;letter-spacing:-.3px;
+  background:#e8edf4;color:#3b6fe0;
+}
+.av-file-name{
+  flex:1;font-size:14px;font-weight:600;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.av-doc-header button{
+  background:none;border:none;cursor:pointer;color:#5b6b7c;
+  padding:6px;border-radius:4px;font-size:15px;line-height:1;
+}
+.av-doc-header button:hover{background:#f0f1f2;}
+.av-menu-wrap{position:relative;}
+.av-dots-btn{
+  background:none;border:none;color:#5b6b7c;
+  border-radius:4px;padding:6px;font-size:15px;
+  cursor:pointer;letter-spacing:1px;line-height:1;
+}
+.av-dots-btn:hover{background:#f0f1f2;}
+.av-dropdown-menu{
+  position:absolute;right:0;top:calc(100% + 4px);
+  background:#fff;border:1px solid var(--av-border);
+  border-radius:6px;box-shadow:0 4px 16px rgba(0,0,0,.16);
+  min-width:160px;z-index:1000;overflow:hidden;display:none;
+}
+.av-dropdown-menu.av-open{display:block;}
+.av-dropdown-menu button{
+  display:flex;align-items:center;gap:8px;width:100%;
+  background:none;border:none;color:#1f1f1f;padding:9px 14px;
+  font-size:13px;cursor:pointer;text-align:left;
+}
+.av-dropdown-menu button:hover{background:#f5f6f7;}
+.av-dropdown-menu button svg{flex:none;}
+.av-content-wrap{display:none;overflow:hidden;border-radius:0 0 8px 8px;}
+.av-content-wrap.av-open{display:block;}
+/* Custom lightweight toolbar (replaces the raw <iframe src=pdf> approach,
+   which surfaced the browser's heavy native PDF toolbar). Centered via a
+   3-column grid so the page/zoom controls sit in the middle regardless of
+   the fullscreen button's width on the right. */
+.av-toolbar{
+  display:none;grid-template-columns:1fr auto 1fr;align-items:center;
+  background:var(--av-bar-bg);color:var(--av-bar-fg);
+  padding:7px 14px;font-size:13px;
+}
+.av-toolbar.av-open{display:grid;}
+.av-tb-center{display:flex;align-items:center;justify-content:center;gap:4px;}
+.av-tb-right{display:flex;justify-content:flex-end;}
+.av-toolbar button{
+  background:none;border:none;color:var(--av-bar-fg);
+  cursor:pointer;padding:5px 8px;border-radius:4px;font-size:14px;line-height:1;
+}
+.av-toolbar button:hover{background:rgba(255,255,255,.12);}
+.av-toolbar button:disabled{color:#555;cursor:default;}
+.av-toolbar button:disabled:hover{background:none;}
+.av-page-indicator{color:var(--av-bar-fg-dim);display:inline-flex;align-items:center;gap:5px;margin:0 2px;}
+.av-page-indicator input{
+  width:30px;text-align:center;background:var(--av-accent);color:#fff;
+  border:none;border-radius:4px;padding:3px 2px;font-size:13px;font-weight:600;
+}
+.av-tb-divider{width:1px;height:16px;background:rgba(255,255,255,.15);display:inline-block;margin:0 4px;}
+.av-zoom-level{color:var(--av-bar-fg-dim);min-width:38px;text-align:center;display:inline-block;}
+.av-canvas-area{
+  width:100%;height:680px;background:#f4f5f6;
+  overflow:auto;display:flex;flex-direction:column;align-items:center;
+  padding:12px 0;gap:8px;
+}
+.av-canvas-area canvas{display:block;box-shadow:0 2px 8px rgba(0,0,0,.18);}
+.av-pdf-msg{color:#888;font-size:13px;padding:40px;text-align:center;}
+"""
+
+_VIEWER_JS = r"""
+(function(){
+  'use strict';
+  function escHtml(s){
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  function mount(el){
+    if(el.dataset.avInit) return;
+    el.dataset.avInit='1';
+    el.classList.add('av-doc-viewer');
+
+    var relFile = el.dataset.file||'';
+    var name    = el.dataset.name || relFile.split('/').pop() || relFile;
+    var ext     = (name.split('.').pop()||'').toLowerCase();
+    var isPdf   = ext==='pdf';
+    var absPath = el.dataset.abs||'';
+    var b64     = el.dataset.b64||'';   // base64 PDF bytes embedded at generation time
+
+    var extLabel  = name.split('.').pop().toUpperCase().slice(0,4)||'FILE';
+    var iconColor = isPdf ? '#e74c3c' : '#3b6fe0';
+    var iconBg    = isPdf ? '#fdecea' : '#e8edf4';
+
+    el.innerHTML =
+      '<div class="av-doc-header">' +
+        '<div class="av-file-icon-wrap" style="color:'+iconColor+';background:'+iconBg+'">'+extLabel+'</div>' +
+        '<span class="av-file-name">'+escHtml(name)+'</span>' +
+        '<div class="av-menu-wrap">' +
+          '<button class="av-dots-btn" title="More options">•••</button>' +
+          '<div class="av-dropdown-menu">' +
+            '<button class="av-copy-path">' +
+              '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>' +
+              '<span class="av-copy-label">Copy file path</span>' +
+            '</button>' +
+          '</div>' +
+        '</div>' +
+        (isPdf ? '<button class="av-collapse-btn" title="Expand">⌄</button>' : '') +
+      '</div>' +
+      (isPdf ?
+        '<div class="av-toolbar">' +
+          '<div class="av-tb-left"></div>' +
+          '<div class="av-tb-center">' +
+            '<button class="av-zoom-out" title="Zoom out">−</button>' +
+            '<span class="av-zoom-level">100%</span>' +
+            '<button class="av-zoom-in" title="Zoom in">+</button>' +
+          '</div>' +
+          '<div class="av-tb-right"><button class="av-fullscreen" title="Fullscreen">⤢</button></div>' +
+        '</div>' +
+        '<div class="av-content-wrap"><div class="av-canvas-area"></div></div>'
+      : '');
+
+    if(!isPdf){ el.classList.add('av-static'); }
+
+    var header      = el.querySelector('.av-doc-header');
+    var contentWrap = el.querySelector('.av-content-wrap');
+    var collapseBtn = el.querySelector('.av-collapse-btn');
+    var dotsBtn     = el.querySelector('.av-dots-btn');
+    var dropdown    = el.querySelector('.av-dropdown-menu');
+    var copyBtn     = el.querySelector('.av-copy-path');
+    var copyLabel   = el.querySelector('.av-copy-label');
+
+    if(isPdf){
+      var toolbar    = el.querySelector('.av-toolbar');
+      var canvasArea = el.querySelector('.av-canvas-area');
+      var zoomOutBtn = el.querySelector('.av-zoom-out');
+      var zoomInBtn  = el.querySelector('.av-zoom-in');
+      var zoomLevel  = el.querySelector('.av-zoom-level');
+      var fsBtn      = el.querySelector('.av-fullscreen');
+
+      var pdfDoc  = null;
+      var zoom    = 1.0;
+      var loaded  = false;
+
+      function renderAll(){
+        if(!pdfDoc) return;
+        canvasArea.innerHTML = '';
+        var total = pdfDoc.numPages;
+        for(var i=1; i<=total; i++){
+          (function(pageNum){
+            pdfDoc.getPage(pageNum).then(function(page){
+              var vp = page.getViewport({scale: zoom});
+              var canvas = document.createElement('canvas');
+              canvas.width  = vp.width;
+              canvas.height = vp.height;
+              canvasArea.appendChild(canvas);
+              page.render({canvasContext: canvas.getContext('2d'), viewport: vp});
+            });
+          })(i);
+        }
+        zoomLevel.textContent = Math.round(zoom*100)+'%';
+      }
+
+      function loadPdf(){
+        if(loaded) return;
+        loaded = true;
+        var lib = window.pdfjsLib;
+        if(!lib){
+          canvasArea.innerHTML = '<div class="av-pdf-msg">pdf.js not loaded — check internet connection.</div>';
+          return;
+        }
+        if(!b64){
+          canvasArea.innerHTML = '<div class="av-pdf-msg">PDF not embedded (fetch failed during archival).</div>';
+          return;
+        }
+        // Convert base64 → Uint8Array and hand straight to pdf.js — no fetch, no file picker
+        var binary = atob(b64);
+        var bytes  = new Uint8Array(binary.length);
+        for(var i=0; i<binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        lib.getDocument({data: bytes}).promise.then(function(doc){
+          pdfDoc = doc;
+          renderAll();
+        }).catch(function(err){
+          canvasArea.innerHTML = '<div class="av-pdf-msg">Could not parse PDF: '+escHtml(String(err))+'</div>';
+        });
+      }
+
+      header.addEventListener('click', function(e){
+        if(e.target.closest('.av-menu-wrap')) return;
+        var open = contentWrap.classList.toggle('av-open');
+        toolbar.classList.toggle('av-open', open);
+        collapseBtn.textContent = open ? '⌃' : '⌄';
+        collapseBtn.title = open ? 'Collapse' : 'Expand';
+        if(open) loadPdf();
+      });
+
+      zoomInBtn.addEventListener('click', function(){
+        zoom = Math.min(+(zoom+0.25).toFixed(2), 4);
+        renderAll();
+      });
+      zoomOutBtn.addEventListener('click', function(){
+        zoom = Math.max(+(zoom-0.25).toFixed(2), 0.3);
+        renderAll();
+      });
+      fsBtn.addEventListener('click', function(){
+        if(!document.fullscreenElement){ if(canvasArea.requestFullscreen) canvasArea.requestFullscreen(); }
+        else if(document.exitFullscreen){ document.exitFullscreen(); }
+      });
+      document.addEventListener('fullscreenchange', function(){
+        fsBtn.textContent = document.fullscreenElement===canvasArea ? '⤡' : '⤢';
+        canvasArea.style.height = document.fullscreenElement===canvasArea ? '100vh' : '';
+      });
+    }
+
+    dotsBtn.addEventListener('click', function(e){
+      e.stopPropagation();
+      dropdown.classList.toggle('av-open');
+    });
+    document.addEventListener('click', function(){
+      dropdown.classList.remove('av-open');
+    });
+
+    copyBtn.addEventListener('click', function(e){
+      e.stopPropagation();
+      var text = absPath || relFile;
+      var reset = function(lbl){
+        copyLabel.textContent = lbl;
+        setTimeout(function(){ copyLabel.textContent='Copy file path'; }, 1400);
+      };
+      if(navigator.clipboard && navigator.clipboard.writeText){
+        navigator.clipboard.writeText(text).then(
+          function(){ reset('Copied!'); },
+          function(){ reset('Copy failed'); }
+        );
+      } else { reset('Copy unsupported'); }
+    });
+  }
+
+  function scan(){
+    document.querySelectorAll('.av-mount').forEach(mount);
+  }
+  if(document.readyState==='loading'){
+    document.addEventListener('DOMContentLoaded', scan);
+  } else { scan(); }
+  window.AttachmentViewer={mount:mount,scan:scan};
+})();
+"""
+
+def inline_viewer_tags():
+    """Return <style>/<script> tags with the viewer CSS/JS inlined.
+    pdf.js is loaded once per page from cdnjs (async, non-blocking).
+    The PDF bytes themselves are embedded as base64 in data-b64 at
+    generation time, so no file loading or CORS issues at view time."""
+    PDFJS_URL    = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'
+    PDFJS_WORKER = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
+    pdfjs_tag = (
+        f'    <script src="{PDFJS_URL}" '
+        f'onload="(window.pdfjsLib||window[\'pdfjs-dist/build/pdf\']||pdfjsLib)'
+        f'.GlobalWorkerOptions.workerSrc=\'{PDFJS_WORKER}\'">'
+        f'</script>\n'
+    )
+    return (
+        '    <style>\n' + _VIEWER_CSS + '\n    </style>\n'
+        + pdfjs_tag
+        + '    <script>\n' + _VIEWER_JS + '\n    </script>\n'
+    )
+
+
+def inject_abs_paths(html_str, page_dir):
+    """Add data-abs="<absolute OS path>" to every .av-mount div so the JS
+    copy-path button can copy the real on-disk path regardless of nesting."""
+    import re as _re
+    def _add_abs(m):
+        tag = m.group(0)
+        rel = _re.search(r'data-file="([^"]*)"', tag)
+        if not rel:
+            return tag
+        abs_path = os.path.abspath(os.path.join(page_dir, rel.group(1)))
+        # Replace backslashes (Windows) with forward slashes for readability
+        abs_path = abs_path.replace(os.sep, '/')
+        return tag[:-1] + f' data-abs="{abs_path}">'
+    return _re.sub(r'<div[^>]*class="av-mount"[^>]*>', _add_abs, html_str)
+
+
 # ── Body post-processor ───────────────────────────────────────────────────────
-def process_body(body_html, session, site, indent=''):
+def process_body(body_html, session, site, indent='', attachments_subdir=''):
     """
     Walk every element in the BB body and:
       1. data-bbfile with image mimeType or render=inlineOnly -> embed as <img base64>
       2. <img src="..."> pointing to BB                       -> embed src as base64
       3. All other <a href> on BB                             -> make absolute
+      4. Non-image data-bbfile attachments: <a> tag is replaced entirely by
+         the viewer card (no dangling BB link). PDFs get their bytes embedded
+         as base64 in data-b64 for zero-dependency offline rendering.
     Returns processed HTML string.
     """
     soup = BeautifulSoup(body_html, 'html.parser')
@@ -220,10 +539,31 @@ def process_body(body_html, session, site, indent=''):
                 if href:
                     tag['href'] = absolute_url(href, site)
         else:
-            # PDFs, docx, and everything else — keep as absolute link, never embed
-            if href and not href.startswith('http'):
-                tag['href'] = absolute_url(href, site)
-            log.debug(f"{indent}  [non-image kept as link] {fname} ({mime})")
+            log.debug(f"{indent}  [non-image attachment] {fname} ({mime})")
+            if fname:
+                rel_name = sanitize_filename(fname)
+                rel_path = f"{attachments_subdir}/{rel_name}" if attachments_subdir else rel_name
+                is_pdf_attach = fname.lower().endswith('.pdf')
+                mount_div = soup.new_tag('div')
+                mount_div['class'] = 'av-mount'
+                mount_div['data-file'] = rel_path
+                mount_div['data-name'] = fname
+                if is_pdf_attach:
+                    for try_url in [u for u in [resource, href] if u]:
+                        b64, _, _ = fetch_as_base64(session, try_url, site, indent)
+                        if b64:
+                            mount_div['data-b64'] = b64
+                            log.info(f"{indent}  {Fore.GREEN}[pdf embedded] {fname}{Style.RESET_ALL}")
+                            break
+                    else:
+                        log.warning(f"{indent}  {Fore.YELLOW}[pdf embed FAILED — viewer will be empty] {fname}{Style.RESET_ALL}")
+                # Replace the <a> tag entirely with the viewer card —
+                # the BB link is useless offline and the card shows the file name anyway.
+                tag.replace_with(mount_div)
+            else:
+                # No filename — can't build a viewer; make the href absolute as fallback
+                if href and not href.startswith('http'):
+                    tag['href'] = absolute_url(href, site)
 
     # ── 2. Plain <img> tags ───────────────────────────────────────────────────
     for img in soup.find_all('img'):
@@ -305,11 +645,21 @@ def extract_file_links_from_body(body_html):
     return file_links
 
 
+def sanitize_filename(filename):
+    """
+    Strip filesystem-unsafe characters the same way download_file() does,
+    so anything that wants to *reference* a downloaded attachment (e.g. the
+    attachment-viewer mount divs in process_body) always computes the exact
+    same on-disk name that download_file() actually wrote.
+    """
+    return unquote(re.sub(r'[<>:"/\\|?*]', '', filename))
+
+
 def download_file(client, url, filename, save_path, fallback_url=''):
     """Download any non-image file. Tries url first, then fallback_url on 403."""
     if url.startswith('/'):
         url = client.site + url
-    filename_safe = unquote(re.sub(r'[<>:"/\\|?*]', '', filename))
+    filename_safe = sanitize_filename(filename)
     dest = os.path.abspath(os.path.join(save_path, filename_safe))
     os.makedirs(os.path.dirname(dest), exist_ok=True)
 
@@ -376,6 +726,9 @@ def save_html_page(content, save_path, client, parent_title=None):
     log.info(f"      {Fore.CYAN}Processing HTML: {filename}{Style.RESET_ALL}")
 
     processed_body = process_body(content.body, client.session, client.site, indent='      ')
+    processed_body = inject_abs_paths(processed_body, save_path)
+
+    viewer_tags = inline_viewer_tags()
 
     # Derive the chapter name from the save_path (immediate parent folder name)
     chapter_name = html_lib.escape(os.path.basename(os.path.dirname(dest)) or '')
@@ -386,7 +739,8 @@ def save_html_page(content, save_path, client, parent_title=None):
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{html_lib.escape(display_title)}</title>
-    <!-- MathJax: renders $...$ and $$...$$ LaTeX from BB content -->
+    <!-- Attachment viewer: inline PDF preview / local-path fallback -->
+{viewer_tags}    <!-- MathJax: renders $...$ and $$...$$ LaTeX from BB content -->
     <script>
     window.MathJax = {{
         tex: {{
@@ -1348,13 +1702,19 @@ def download_assignment(content, save_path, client, save_html_pages=True, indent
     if instructions:
         dest = os.path.join(assign_path, 'instructions.html')
         if not os.path.isfile(dest):
-            # Process body to embed images and absolutise links
+            # Process body to embed images and absolutise links. Instructor
+            # attachments for assignments land in assign_path/attachments/,
+            # one level below this page, hence attachments_subdir='attachments'.
             processed = process_body(instructions, client.session, client.site,
-                                     indent=indent + '      ')
+                                     indent=indent + '      ',
+                                     attachments_subdir='attachments')
+            processed = inject_abs_paths(processed, assign_path)
+            viewer_tags = inline_viewer_tags()
             page = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <title>{html_lib.escape(content.title or '')}</title>
-<style>
+<!-- Attachment viewer: inline PDF preview / local-path fallback -->
+{viewer_tags}<style>
 body{{font-family:Arial,sans-serif;font-size:14px;line-height:1.6;max-width:820px;
      padding:24px 40px;color:#222;background:#fff;}}
 h1{{font-size:1.4rem;font-weight:600;margin:0 0 1.2em 0;color:#1a1a1a;
