@@ -12,7 +12,7 @@ ESPRIT Complete Downloader - Download and archive Blackboard course content with
 
 ## Setup
 
-just donwload the (zip file)[https://codeload.github.com/alcoholic-lain/BB-archiver-esprit/zip/refs/heads/master] then extract and run the following commands :
+just donwload the [zip file](https://codeload.github.com/alcoholic-lain/BB-archiver-esprit/zip/refs/heads/master) then extract and run the following commands :
 
 **Using uv:**
 ```bash
