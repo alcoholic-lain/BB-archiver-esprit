@@ -12,6 +12,8 @@ ESPRIT Complete Downloader - Download and archive Blackboard course content with
 
 ## Setup
 
+just donwload the zip and run the following commands :
+
 **Using uv:**
 ```bash
 uv sync
